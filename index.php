@@ -7,28 +7,44 @@ if (!isset($_SESSION['uid'])) {
 }
 $uid = $_SESSION['uid'];
 
-// SQLite andmebaas (fail luuakse automaatselt)
+// ── Loe .env fail ──────────────────────────────────────────────────────────────
+$envFile = __DIR__ . '/.env';
+if (!file_exists($envFile)) {
+    die('<h1>Viga: .env fail puudub!</h1>');
+}
+foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $rida) {
+    if (str_starts_with(trim($rida), '#') || !str_contains($rida, '=')) continue;
+    [$key, $val] = explode('=', $rida, 2);
+    $_ENV[trim($key)] = trim($val);
+}
+// ───────────────────────────────────────────────────────────────────────────────
+
 try {
-    $db = new PDO('sqlite:' . __DIR__ . '/suva.db');
+    $db = new PDO(
+        'mysql:host=' . $_ENV['DB_HOST'] . ';dbname=' . $_ENV['DB_NAME'] . ';charset=utf8mb4',
+        $_ENV['DB_USER'],
+        $_ENV['DB_PASS']
+    );
     $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $db->exec('PRAGMA foreign_keys = ON');
+    $db->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
 
     $db->exec("CREATE TABLE IF NOT EXISTS SUVA (
-        id     INTEGER PRIMARY KEY AUTOINCREMENT,
-        TEKST  TEXT    NOT NULL,
-        loodud DATETIME DEFAULT CURRENT_TIMESTAMP
-    )");
+        id     INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        TEKST  TEXT         NOT NULL,
+        loodud DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
     // Reaktsioonid: üks rida kasutaja+kirje kohta; dislaigil on kohustuslik põhjus
     $db->exec("CREATE TABLE IF NOT EXISTS reactions (
-        id      INTEGER PRIMARY KEY AUTOINCREMENT,
-        suva_id INTEGER NOT NULL,
-        uid     TEXT    NOT NULL,
-        tyyp    TEXT    NOT NULL CHECK(tyyp IN ('like','dislike')),
+        id      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        suva_id INT          NOT NULL,
+        uid     VARCHAR(64)  NOT NULL,
+        tyyp    ENUM('like','dislike') NOT NULL,
         pohjus  TEXT,
-        FOREIGN KEY(suva_id) REFERENCES SUVA(id) ON DELETE CASCADE,
-        UNIQUE(suva_id, uid)
-    )");
+        UNIQUE KEY uk_kasutaja_kirje (suva_id, uid),
+        FOREIGN KEY (suva_id) REFERENCES SUVA(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
 } catch (PDOException $e) {
     if (isset($_POST['a'])) {
         header('Content-Type: application/json');
