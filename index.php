@@ -1,561 +1,464 @@
 <?php
-session_start();
-
-// Iga kasutaja saab unikaalse sessiooni identifikaatori
-if (!isset($_SESSION['uid'])) {
-    $_SESSION['uid'] = bin2hex(random_bytes(16));
-}
-$uid = $_SESSION['uid'];
-
-// ── Loe .env fail ──────────────────────────────────────────────────────────────
+// ── .env laadimine ─────────────────────────────────────────────────────────────
 $envFile = __DIR__ . '/.env';
-if (!file_exists($envFile)) {
-    die('<h1>Viga: .env fail puudub!</h1>');
+if (!file_exists($envFile)) die('<h1>Viga: .env fail puudub!</h1>');
+$env = [];
+foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+    $line = trim($line);
+    if ($line === '' || $line[0] === '#' || strpos($line, '=') === false) continue;
+    [$key, $value] = explode('=', $line, 2);
+    $env[trim($key)] = trim($value);
 }
-foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $rida) {
-    if (str_starts_with(trim($rida), '#') || !str_contains($rida, '=')) continue;
-    [$key, $val] = explode('=', $rida, 2);
-    $_ENV[trim($key)] = trim($val);
-}
-// ───────────────────────────────────────────────────────────────────────────────
 
-try {
-    $db = new PDO(
-        'mysql:host=' . $_ENV['DB_HOST'] . ';dbname=' . $_ENV['DB_NAME'] . ';charset=utf8mb4',
-        $_ENV['DB_USER'],
-        $_ENV['DB_PASS']
-    );
-    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $db->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
+define('DB_HOST', $env['DB_HOST'] ?? '');
+define('DB_NAME', $env['DB_NAME'] ?? '');
+define('DB_USER', $env['DB_USER'] ?? '');
+define('DB_PASS', $env['DB_PASS'] ?? '');
 
-    $db->exec("CREATE TABLE IF NOT EXISTS SUVA (
-        id     INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        TEKST  TEXT         NOT NULL,
-        loodud DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-    // Reaktsioonid: üks rida kasutaja+kirje kohta; dislaigil on kohustuslik põhjus
-    $db->exec("CREATE TABLE IF NOT EXISTS reactions (
-        id      INT          NOT NULL AUTO_INCREMENT PRIMARY KEY,
-        suva_id INT          NOT NULL,
-        uid     VARCHAR(64)  NOT NULL,
-        tyyp    ENUM('like','dislike') NOT NULL,
-        pohjus  TEXT,
-        UNIQUE KEY uk_kasutaja_kirje (suva_id, uid),
-        FOREIGN KEY (suva_id) REFERENCES SUVA(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-
-} catch (PDOException $e) {
-    if (isset($_POST['a'])) {
-        header('Content-Type: application/json');
-        echo json_encode(['ok' => false, 'msg' => 'DB viga: ' . $e->getMessage()]);
-        exit;
+// ── API päringud ───────────────────────────────────────────────────────────────
+if (isset($_GET['action'])) {
+    session_start();
+    if (empty($_SESSION['uid'])) {
+        $_SESSION['uid'] = bin2hex(random_bytes(32));
     }
-    die('<h1>Andmebaasi viga: ' . htmlspecialchars($e->getMessage()) . '</h1>');
-}
+    $uid = $_SESSION['uid'];
 
-// ── AJAX päringute töötlus ─────────────────────────────────────────────────────
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['a'])) {
     header('Content-Type: application/json');
-    $a = $_POST['a'];
 
     try {
-        switch ($a) {
+        $db = new PDO(
+            'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4',
+            DB_USER, DB_PASS,
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_EMULATE_PREPARES => false]
+        );
 
-            // Lisa uus tekst baasi
-            case 'lisa': {
-                $t = trim($_POST['tekst'] ?? '');
-                if ($t === '') {
-                    echo json_encode(['ok' => false, 'msg' => 'Tekst ei saa olla tühi!']);
-                    exit;
-                }
-                $s = $db->prepare("INSERT INTO SUVA(TEKST) VALUES(?)");
-                $s->execute([$t]);
-                echo json_encode(['ok' => true, 'id' => (int)$db->lastInsertId()]);
-                exit;
+        $db->exec("CREATE TABLE IF NOT EXISTS SUVA (
+            id     INT  NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            TEKST  TEXT NOT NULL,
+            loodud TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        $db->exec("CREATE TABLE IF NOT EXISTS reactions (
+            id      INT         NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            suva_id INT         NOT NULL,
+            uid     VARCHAR(64) NOT NULL,
+            tyyp    ENUM('like','dislike') NOT NULL,
+            pohjus  TEXT,
+            UNIQUE KEY uk_sessioon_kirje (suva_id, uid),
+            FOREIGN KEY (suva_id) REFERENCES SUVA(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+        // Lae kõik kirjed koos reaktsioonidega
+        if ($_GET['action'] === 'get') {
+            $s = $db->prepare("
+                SELECT s.id, s.TEKST, s.loodud,
+                    COUNT(CASE WHEN r.tyyp='like'    THEN 1 END) AS laigid,
+                    COUNT(CASE WHEN r.tyyp='dislike' THEN 1 END) AS dislaigid,
+                    ur.tyyp   AS minu_olek,
+                    ur.pohjus AS minu_pohjus
+                FROM SUVA s
+                LEFT JOIN reactions r  ON s.id = r.suva_id
+                LEFT JOIN reactions ur ON s.id = ur.suva_id AND ur.uid = ?
+                GROUP BY s.id, ur.tyyp, ur.pohjus
+                ORDER BY s.loodud DESC
+            ");
+            $s->execute([$uid]);
+            echo json_encode(['success' => true, 'items' => $s->fetchAll(PDO::FETCH_ASSOC)]);
+
+        // Lisa uus kirje
+        } elseif ($_GET['action'] === 'add') {
+            $input = json_decode(file_get_contents('php://input'), true);
+            $tekst = trim($input['tekst'] ?? '');
+            if ($tekst === '') { echo json_encode(['success' => false, 'msg' => 'Tekst on tühi!']); exit; }
+            $s = $db->prepare("INSERT INTO SUVA (TEKST) VALUES (?)");
+            $s->execute([$tekst]);
+            echo json_encode(['success' => true, 'id' => (int)$db->lastInsertId()]);
+
+        // Reageeri (laik / dislaik)
+        } elseif ($_GET['action'] === 'react') {
+            $input  = json_decode(file_get_contents('php://input'), true);
+            $sid    = (int)($input['id']     ?? 0);
+            $typ    = $input['type']   ?? '';
+            $pohjus = trim($input['reason'] ?? '');
+
+            if (!in_array($typ, ['like', 'dislike'])) {
+                echo json_encode(['success' => false, 'msg' => 'Vigane reaktsioon']); exit;
             }
 
-            // Laigi / dislaigi reaktsioon
-            case 'reageeri': {
-                $sid = (int)($_POST['sid'] ?? 0);
-                $typ = $_POST['typ'] ?? '';
-                $poh = trim($_POST['poh'] ?? '');
+            $s = $db->prepare("SELECT tyyp FROM reactions WHERE suva_id=? AND uid=?");
+            $s->execute([$sid, $uid]);
+            $praegune = $s->fetchColumn();
 
-                if (!in_array($typ, ['like', 'dislike'])) {
-                    echo json_encode(['ok' => false, 'msg' => 'Vigane reaktsioon']);
-                    exit;
+            if ($praegune === $typ) {
+                // Toggle off — sama nuppu vajutades eemalda
+                $db->prepare("DELETE FROM reactions WHERE suva_id=? AND uid=?")->execute([$sid, $uid]);
+                echo json_encode(['success' => true, 'olek' => 'none']);
+            } else {
+                if ($typ === 'dislike' && $pohjus === '') {
+                    echo json_encode(['success' => false, 'msg' => 'Dislaigi põhjus on kohustuslik!']); exit;
                 }
-
-                // Loe praegune reaktsioon (kui olemas)
-                $s = $db->prepare("SELECT tyyp FROM reactions WHERE suva_id=? AND uid=?");
-                $s->execute([$sid, $uid]);
-                $praegune = $s->fetchColumn(); // 'like' | 'dislike' | false
-
-                if ($praegune === $typ) {
-                    // Sama nuppu vajutades → eemalda reaktsioon (toggle off)
-                    // NB: dislaigi eemaldamine EI nõua põhjust
-                    $db->prepare("DELETE FROM reactions WHERE suva_id=? AND uid=?")
-                       ->execute([$sid, $uid]);
-                    echo json_encode(['ok' => true, 'olek' => 'none']);
-
+                $pohjusDb = $typ === 'dislike' ? $pohjus : null;
+                if ($praegune !== false) {
+                    $db->prepare("UPDATE reactions SET tyyp=?, pohjus=? WHERE suva_id=? AND uid=?")
+                       ->execute([$typ, $pohjusDb, $sid, $uid]);
                 } else {
-                    // Uus reaktsioon või vaheta olemasolevat
-                    // Dislaik vajab ALATI põhjust (v.a toggle-off, mis on juba käsitletud)
-                    if ($typ === 'dislike' && $poh === '') {
-                        echo json_encode(['ok' => false, 'msg' => 'Dislaigi põhjus on kohustuslik!']);
-                        exit;
-                    }
-                    $pohjusDb = ($typ === 'dislike') ? $poh : null; // Laigil ei ole põhjust
-
-                    if ($praegune !== false) {
-                        // Vaheta olemasolevat reaktsiooni
-                        $db->prepare("UPDATE reactions SET tyyp=?, pohjus=? WHERE suva_id=? AND uid=?")
-                           ->execute([$typ, $pohjusDb, $sid, $uid]);
-                    } else {
-                        // Lisa täiesti uus reaktsioon
-                        $db->prepare("INSERT INTO reactions(suva_id, uid, tyyp, pohjus) VALUES(?,?,?,?)")
-                           ->execute([$sid, $uid, $typ, $pohjusDb]);
-                    }
-                    echo json_encode(['ok' => true, 'olek' => $typ]);
+                    $db->prepare("INSERT INTO reactions (suva_id, uid, tyyp, pohjus) VALUES (?,?,?,?)")
+                       ->execute([$sid, $uid, $typ, $pohjusDb]);
                 }
-                exit;
+                echo json_encode(['success' => true, 'olek' => $typ]);
             }
 
-            // Kustuta kirje (CASCADE kustutab ka kõik reaktsioonid)
-            case 'kustuta': {
-                $sid = (int)($_POST['sid'] ?? 0);
-                $db->prepare("DELETE FROM SUVA WHERE id=?")->execute([$sid]);
-                echo json_encode(['ok' => true]);
-                exit;
-            }
-
-            // Lae kõik kirjed koos reaktsioonide arvudega ja selle kasutaja olekuga
-            case 'lae': {
-                $qu = $db->quote($uid); // PDO::quote lisab jutumärgid ja escape'ib
-                $st = $db->query("
-                    SELECT
-                        s.id,
-                        s.TEKST,
-                        s.loodud,
-                        COUNT(CASE WHEN r.tyyp='like'    THEN 1 END) AS laigid,
-                        COUNT(CASE WHEN r.tyyp='dislike' THEN 1 END) AS dislaigid,
-                        ur.tyyp   AS minu_olek,
-                        ur.pohjus AS minu_pohjus
-                    FROM SUVA s
-                    LEFT JOIN reactions r  ON s.id = r.suva_id
-                    LEFT JOIN reactions ur ON s.id = ur.suva_id AND ur.uid = $qu
-                    GROUP BY s.id
-                    ORDER BY s.loodud DESC
-                ");
-                echo json_encode(['ok' => true, 'read' => $st->fetchAll(PDO::FETCH_ASSOC)]);
-                exit;
-            }
-
-            default:
-                echo json_encode(['ok' => false, 'msg' => 'Tundmatu tegevus']);
-                exit;
+        // Kustuta kirje
+        } elseif ($_GET['action'] === 'delete') {
+            $input = json_decode(file_get_contents('php://input'), true);
+            $sid   = (int)($input['id'] ?? 0);
+            $db->prepare("DELETE FROM SUVA WHERE id=?")->execute([$sid]);
+            echo json_encode(['success' => true]);
         }
+
     } catch (PDOException $e) {
-        echo json_encode(['ok' => false, 'msg' => 'DB viga: ' . $e->getMessage()]);
-        exit;
+        http_response_code(500);
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
     }
+    exit;
 }
 ?>
 <!DOCTYPE html>
 <html lang="et">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>SUVA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
+:root {
+    --bg: #0f0f0f; --surface: #1a1a1a; --surface2: #222;
+    --border: #2a2a2a; --text: #e8e4dc; --muted: #555;
+    --up: #22c55e; --down: #ef4444; --accent: #f0e96a;
+}
 body {
-    font-family: 'Segoe UI', Tahoma, Geneva, sans-serif;
-    background: #eef1f7;
-    min-height: 100vh;
-    padding-bottom: 48px;
+    min-height: 100vh; background: var(--bg);
+    font-family: 'DM Sans', sans-serif; color: var(--text);
+    padding: 40px 16px 64px;
+}
+body::before {
+    content: ''; position: fixed; inset: 0; pointer-events: none;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    opacity: .03;
 }
 
-.wrap { max-width: 680px; margin: 0 auto; padding: 36px 16px; }
+.wrap { max-width: 640px; margin: 0 auto; position: relative; z-index: 1; }
 
-h1 {
-    text-align: center;
-    font-size: 2rem;
-    color: #1e2a4a;
-    margin-bottom: 28px;
-    letter-spacing: 2px;
-}
+/* ── Pealkiri ── */
+.header { text-align: center; margin-bottom: 40px; animation: fadeUp .5s ease both; }
+.label  { font-size: 11px; font-weight: 300; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin-bottom: 14px; }
+h1 { font-family: 'Syne', sans-serif; font-size: clamp(1.8rem, 6vw, 2.6rem); font-weight: 800; line-height: 1.1; }
+h1 span { color: var(--accent); }
 
 /* ── Sisestus ── */
 .sisestus {
-    display: flex;
-    gap: 10px;
-    background: #fff;
-    padding: 16px;
-    border-radius: 14px;
-    box-shadow: 0 2px 12px rgba(0,0,0,.09);
-    margin-bottom: 28px;
+    display: flex; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+    padding: 14px; margin-bottom: 32px;
+    box-shadow: 0 0 0 1px #ffffff06, 0 16px 40px #00000040;
+    animation: fadeUp .5s .1s ease both;
 }
 .sisestus input {
-    flex: 1;
-    padding: 11px 15px;
-    border: 2px solid #dde3ef;
-    border-radius: 9px;
-    font-size: 1rem;
-    font-family: inherit;
-    color: #222;
-    transition: border-color .2s;
+    flex: 1; background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 12px; color: var(--text); font-family: 'DM Sans', sans-serif;
+    font-size: .95rem; padding: 12px 16px; outline: none; transition: border-color .2s;
 }
-.sisestus input:focus { outline: none; border-color: #4c7ef3; }
-.sisestus input.viga { border-color: #e53935; animation: shake .3s; }
+.sisestus input::placeholder { color: var(--muted); }
+.sisestus input:focus { border-color: var(--accent); }
+.sisestus input.viga { border-color: var(--down); animation: shake .3s; }
 @keyframes shake {
-    0%,100% { transform: translateX(0); }
-    25% { transform: translateX(-6px); }
-    75% { transform: translateX(6px); }
+    0%,100% { transform:translateX(0); } 25% { transform:translateX(-5px); } 75% { transform:translateX(5px); }
 }
-
-/* ── Nupud ── */
-.nupp {
-    padding: 11px 22px;
-    border: none;
-    border-radius: 9px;
-    cursor: pointer;
-    font-size: .95rem;
-    font-weight: 700;
-    font-family: inherit;
-    transition: background .18s, transform .1s;
-    white-space: nowrap;
+.btn-add {
+    padding: 12px 22px; border: none; border-radius: 12px; background: var(--accent);
+    color: #111; font-family: 'DM Sans', sans-serif; font-size: .9rem; font-weight: 500;
+    cursor: pointer; white-space: nowrap; transition: opacity .2s, transform .1s;
 }
-.nupp:active { transform: scale(.96); }
-.n-sinine  { background: #4c7ef3; color: #fff; }
-.n-sinine:hover  { background: #3a6be0; }
-.n-hall    { background: #eef1f7; color: #555; }
-.n-hall:hover    { background: #dde3ef; }
-.n-punane  { background: #e53935; color: #fff; }
-.n-punane:hover  { background: #c62828; }
+.btn-add:hover { opacity: .88; }
+.btn-add:active { transform: scale(.96); }
 
 /* ── Kaardid ── */
 .kaart {
-    background: #fff;
-    border-radius: 14px;
-    padding: 18px 20px;
-    margin-bottom: 14px;
-    box-shadow: 0 2px 10px rgba(0,0,0,.07);
-    animation: ilmu .22s ease;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+    padding: 22px 24px; margin-bottom: 14px;
+    box-shadow: 0 0 0 1px #ffffff05, 0 8px 24px #00000030;
+    animation: fadeUp .3s ease both;
 }
-@keyframes ilmu {
-    from { opacity: 0; transform: translateY(8px); }
-    to   { opacity: 1; transform: none; }
-}
-.kaart-tekst {
-    font-size: 1.05rem;
-    color: #222;
-    line-height: 1.55;
-    margin-bottom: 8px;
-    word-break: break-word;
-}
-.kaart-meta { font-size: .78rem; color: #aaa; margin-bottom: 12px; }
-
-.rida { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+@keyframes fadeUp { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:none; } }
+.kaart-tekst { font-size: 1rem; line-height: 1.6; color: var(--text); margin-bottom: 10px; word-break: break-word; }
+.kaart-meta  { font-size: .75rem; color: var(--muted); font-weight: 300; margin-bottom: 16px; }
 
 /* ── Reaktsiooninupud ── */
+.rida { display: flex; align-items: center; gap: 10px; }
 .r-nupp {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 7px 16px;
-    border-radius: 999px;
-    border: 2px solid #e0e6f0;
-    background: #f7f9fc;
-    color: #666;
-    font-size: .9rem;
-    font-weight: 700;
-    cursor: pointer;
-    font-family: inherit;
-    user-select: none;
-    transition: all .18s;
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 8px 18px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--surface2); color: var(--muted);
+    font-family: 'DM Sans', sans-serif; font-size: .85rem; font-weight: 500;
+    cursor: pointer; user-select: none; transition: all .2s; position: relative; overflow: hidden;
 }
-.r-nupp:hover { transform: scale(1.07); box-shadow: 0 2px 8px rgba(0,0,0,.1); }
+.r-nupp:hover { transform: translateY(-2px); border-color: #444; color: var(--text); }
 .r-nupp:active { transform: scale(.95); }
-.r-nupp.laik    { background: #e8f0fe; border-color: #4c7ef3; color: #3a6be0; }
-.r-nupp.dislaik { background: #fdecea; border-color: #e53935; color: #c62828; }
+.r-nupp.laik    { border-color: var(--up);   background: #22c55e12; color: var(--up); }
+.r-nupp.dislaik { border-color: var(--down); background: #ef444412; color: var(--down); }
+.r-nupp.inactive { opacity: .35; }
 
-.kustuta {
-    margin-left: auto;
-    background: none;
-    border: none;
-    color: #ccc;
-    cursor: pointer;
-    font-size: 1.4rem;
-    line-height: 1;
-    padding: 4px 8px;
-    border-radius: 8px;
-    font-family: inherit;
-    transition: color .18s, background .18s;
+.btn-kustuta {
+    margin-left: auto; background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 1.2rem; line-height: 1; padding: 6px 10px;
+    border-radius: 8px; transition: color .2s, background .2s;
 }
-.kustuta:hover { color: #e53935; background: #fdecea; }
+.btn-kustuta:hover { color: var(--down); background: #ef444415; }
 
 /* ── Dislaigi põhjus ── */
 .pohjus-riba {
-    margin-top: 11px;
-    padding: 8px 12px;
-    background: #fdecea;
-    border-left: 3px solid #e53935;
-    border-radius: 0 8px 8px 0;
-    font-size: .83rem;
-    color: #c62828;
-    word-break: break-word;
+    margin-top: 14px; padding: 10px 14px;
+    background: #ef444410; border-left: 2px solid var(--down);
+    border-radius: 0 10px 10px 0; font-size: .82rem; color: #f87171;
+    font-weight: 300; word-break: break-word;
 }
-.pohjus-riba strong { display: block; margin-bottom: 2px; }
+.pohjus-riba strong { display: block; font-weight: 500; margin-bottom: 2px; font-size: .78rem; letter-spacing: .05em; text-transform: uppercase; color: var(--down); }
 
 /* ── Info ── */
-.info { text-align: center; color: #bbb; padding: 52px 16px; font-size: 1rem; }
+.info { text-align: center; color: var(--muted); padding: 56px 16px; font-size: .95rem; font-weight: 300; }
 
-/* ── Modal ── */
-.modal-mask {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(20,30,60,.5);
-    backdrop-filter: blur(3px);
-    z-index: 999;
-    align-items: center;
-    justify-content: center;
+/* ── Overlay / Modal ── */
+.overlay {
+    position: fixed; inset: 0; background: #00000090; backdrop-filter: blur(6px);
+    display: flex; align-items: center; justify-content: center; z-index: 100;
+    opacity: 0; pointer-events: none; transition: opacity .3s;
 }
-.modal-mask.sees { display: flex; }
-
+.overlay.open { opacity: 1; pointer-events: all; }
 .modal {
-    background: #fff;
-    border-radius: 16px;
-    padding: 30px;
-    width: 92%;
-    max-width: 430px;
-    box-shadow: 0 12px 40px rgba(0,0,0,.25);
-    animation: ilmu .2s ease;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 22px;
+    padding: 36px 32px 30px; max-width: 420px; width: 88vw;
+    box-shadow: 0 24px 80px #00000080;
+    transform: scale(.92); transition: transform .35s cubic-bezier(.34,1.56,.64,1);
 }
-.modal h2 { font-size: 1.2rem; color: #1e2a4a; margin-bottom: 6px; }
-.modal > p { font-size: .9rem; color: #666; margin-bottom: 16px; line-height: 1.5; }
-.modal textarea {
-    width: 100%;
-    padding: 11px 13px;
-    border: 2px solid #dde3ef;
-    border-radius: 9px;
-    font-size: .95rem;
-    font-family: inherit;
-    resize: vertical;
-    min-height: 90px;
-    color: #222;
-    transition: border-color .2s;
+.overlay.open .modal { transform: scale(1); }
+.modal h2 { font-family: 'Syne', sans-serif; font-size: 1.2rem; font-weight: 800; margin-bottom: 6px; }
+.modal p  { font-size: .88rem; color: var(--muted); font-weight: 300; margin-bottom: 20px; line-height: 1.6; }
+textarea {
+    width: 100%; min-height: 100px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 12px; color: var(--text); font-family: 'DM Sans', sans-serif;
+    font-size: .9rem; padding: 13px 15px; resize: vertical; outline: none;
+    transition: border-color .2s; margin-bottom: 6px;
 }
-.modal textarea:focus { outline: none; border-color: #e53935; }
-.viga-tekst { min-height: 20px; font-size: .82rem; color: #e53935; margin-top: 6px; }
-.modal-nupud { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+textarea:focus { border-color: var(--down); }
+textarea::placeholder { color: var(--muted); }
+.viga-tekst { min-height: 18px; font-size: .8rem; color: var(--down); margin-bottom: 14px; }
+.modal-btns { display: flex; gap: 10px; }
+.btn-cancel {
+    flex: 1; padding: 12px; border: 1px solid var(--border); border-radius: 12px;
+    background: none; color: var(--muted); font-family: 'DM Sans', sans-serif;
+    font-size: .88rem; cursor: pointer; transition: background .2s;
+}
+.btn-cancel:hover { background: var(--surface2); }
+.btn-confirm {
+    flex: 2; padding: 12px; border: none; border-radius: 12px; background: var(--down);
+    color: #fff; font-family: 'DM Sans', sans-serif; font-size: .88rem; font-weight: 500;
+    cursor: pointer; transition: opacity .2s;
+}
+.btn-confirm:hover { opacity: .85; }
+
+@keyframes ripple { from { transform:scale(0); opacity:.3; } to { transform:scale(5); opacity:0; } }
+.ripple {
+    position: absolute; border-radius: 50%; width: 50px; height: 50px;
+    pointer-events: none; animation: ripple .5s ease-out forwards;
+    margin-top: -25px; margin-left: -25px;
+}
 </style>
 </head>
 <body>
-
 <div class="wrap">
-    <h1>SUVA</h1>
+    <div class="header">
+        <p class="label">Kommentaarid</p>
+        <h1>SUVA <span>baas</span></h1>
+    </div>
 
     <div class="sisestus">
-        <input type="text" id="tekst" placeholder="Sisesta tekst..." maxlength="500" autocomplete="off">
-        <button class="nupp n-sinine" onclick="saada()">Saada baasi</button>
+        <input type="text" id="tekst" placeholder="Sisesta tekst..." maxlength="500" autocomplete="off" />
+        <button class="btn-add" onclick="lisaKirje()">Saada baasi</button>
     </div>
 
-    <div id="loend">
-        <div class="info">Laen...</div>
-    </div>
+    <div id="loend"><div class="info">Laen…</div></div>
 </div>
 
-<!-- Modal: dislaigi põhjus -->
-<div class="modal-mask" id="mask" onclick="maskKlops(event)">
-    <div class="modal" id="modalBoks">
-        <h2>👎 Miks ei meeldi?</h2>
-        <p>Palun selgita lühidalt, miks see tekst sulle ei meeldi.<br>
-           Põhjuse sisestamine on kohustuslik.</p>
-        <textarea id="pohjus" placeholder="Sisesta põhjus..." maxlength="300"></textarea>
+<!-- Dislaigi põhjuse modal -->
+<div class="overlay" id="overlay" onclick="overlayKlõps(event)">
+    <div class="modal">
+        <h2>Miks ei meeldi? 🤔</h2>
+        <p>Sinu tagasiside on kasulik. Põhjus on kohustuslik.</p>
+        <textarea id="pohjus-tekst" placeholder="Kirjuta siia…" maxlength="500"></textarea>
         <div class="viga-tekst" id="modal-viga"></div>
-        <div class="modal-nupud">
-            <button class="nupp n-hall"   onclick="sulge()">Tühista</button>
-            <button class="nupp n-punane" onclick="kinnita()">Dislaigi</button>
+        <div class="modal-btns">
+            <button class="btn-cancel"  onclick="sulgeModal()">Tühista</button>
+            <button class="btn-confirm" onclick="kinnitaDislaik()">Dislaigi</button>
         </div>
     </div>
 </div>
 
 <script>
-'use strict';
-
-let ootelSid = null; // millisele SUVA kirjele oodatav dislaik
+const API = 'index.php';
+let ootelId = null;
 
 // ── Utiliidid ─────────────────────────────────────────────────────────────────
 
-async function post(data) {
-    const fd = new FormData();
-    for (const [k, v] of Object.entries(data)) fd.append(k, v ?? '');
-    const r = await fetch(location.href, { method: 'POST', body: fd });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
+function api(action, body) {
+    return fetch(API + '?action=' + action, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    }).then(function(r) { return r.json(); });
+}
+
+function get(action) {
+    return fetch(API + '?action=' + action).then(function(r) { return r.json(); });
 }
 
 function esc(s) {
-    return String(s ?? '')
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function formatAeg(s) {
     if (!s) return '';
-    const d = new Date(s.replace(' ', 'T') + '+00:00');
-    if (isNaN(d)) return s;
-    return d.toLocaleString('et-EE', {
-        day: '2-digit', month: '2-digit', year: 'numeric',
-        hour: '2-digit', minute: '2-digit'
-    });
+    try {
+        var d = new Date(s.replace(' ','T'));
+        return d.toLocaleString('et-EE', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+    } catch(e) { return s; }
 }
 
-// ── Lisa tekst ────────────────────────────────────────────────────────────────
+function ripple(btn, color) {
+    var r = document.createElement('span');
+    r.className = 'ripple'; r.style.background = color;
+    r.style.top = '50%'; r.style.left = '50%';
+    btn.appendChild(r);
+    r.addEventListener('animationend', function() { r.remove(); });
+}
 
-async function saada() {
-    const el = document.getElementById('tekst');
-    const t = el.value.trim();
+// ── Lisa kirje ────────────────────────────────────────────────────────────────
+
+function lisaKirje() {
+    var el = document.getElementById('tekst');
+    var t  = el.value.trim();
     if (!t) {
         el.classList.add('viga');
         el.focus();
-        setTimeout(() => el.classList.remove('viga'), 800);
+        setTimeout(function() { el.classList.remove('viga'); }, 800);
         return;
     }
-    try {
-        const r = await post({ a: 'lisa', tekst: t });
-        if (r.ok) { el.value = ''; await laeLoend(); }
+    api('add', { tekst: t }).then(function(r) {
+        if (r.success) { el.value = ''; laeLoend(); }
         else alert(r.msg);
-    } catch (e) { alert('Viga: ' + e.message); }
+    });
 }
 
-document.getElementById('tekst').addEventListener('keydown', e => {
-    if (e.key === 'Enter') saada();
+document.getElementById('tekst').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') lisaKirje();
 });
 
 // ── Lae loend ────────────────────────────────────────────────────────────────
 
-async function laeLoend() {
-    const el = document.getElementById('loend');
-    try {
-        const r = await post({ a: 'lae' });
-        if (!r.ok) { el.innerHTML = '<div class="info">Viga: ' + esc(r.msg) + '</div>'; return; }
-        if (!r.read || r.read.length === 0) {
-            el.innerHTML = '<div class="info">Kirjeid pole. Sisesta esimene tekst!</div>';
+function laeLoend() {
+    var el = document.getElementById('loend');
+    get('get').then(function(r) {
+        if (!r.success) { el.innerHTML = '<div class="info">Viga: ' + esc(r.error) + '</div>'; return; }
+        if (!r.items || r.items.length === 0) {
+            el.innerHTML = '<div class="info">Kirjeid pole veel. Sisesta esimene!</div>';
             return;
         }
-        el.innerHTML = r.read.map(k => {
-            const olek = k.minu_olek || 'none';
-            const pohjusHtml = (olek === 'dislike' && k.minu_pohjus)
-                ? `<div class="pohjus-riba"><strong>Sinu dislaigi põhjus:</strong>${esc(k.minu_pohjus)}</div>`
+        el.innerHTML = r.items.map(function(k, i) {
+            var olek = k.minu_olek || 'none';
+            var laigid    = parseInt(k.laigid)    || 0;
+            var dislaigid = parseInt(k.dislaigid) || 0;
+            var pohjusHtml = (olek === 'dislike' && k.minu_pohjus)
+                ? '<div class="pohjus-riba"><strong>Sinu põhjus</strong>' + esc(k.minu_pohjus) + '</div>'
                 : '';
-            return `
-            <div class="kaart" id="k${k.id}" data-olek="${esc(olek)}">
-                <div class="kaart-tekst">${esc(k.TEKST)}</div>
-                <div class="kaart-meta">${formatAeg(k.loodud)}</div>
-                <div class="rida">
-                    <button class="r-nupp ${olek === 'like' ? 'laik' : ''}"
-                            onclick="reageeri(${k.id}, 'like')" title="Laigi">
-                        👍 <span>${parseInt(k.laigid) || 0}</span>
-                    </button>
-                    <button class="r-nupp ${olek === 'dislike' ? 'dislaik' : ''}"
-                            onclick="reageeri(${k.id}, 'dislike')" title="Dislaigi">
-                        👎 <span>${parseInt(k.dislaigid) || 0}</span>
-                    </button>
-                    <button class="kustuta" onclick="kustuta(${k.id})" title="Kustuta kirje">×</button>
-                </div>
-                ${pohjusHtml}
-            </div>`;
+            return '<div class="kaart" id="k' + k.id + '" data-olek="' + olek + '" style="animation-delay:' + (i * 0.04) + 's">' +
+                '<div class="kaart-tekst">' + esc(k.TEKST) + '</div>' +
+                '<div class="kaart-meta">' + formatAeg(k.loodud) + '</div>' +
+                '<div class="rida">' +
+                    '<button class="r-nupp ' + (olek==='like' ? 'laik' : olek==='dislike' ? 'inactive' : '') + '" ' +
+                        'onclick="reageeri(' + k.id + ',\'like\',this)">👍 ' + laigid + '</button>' +
+                    '<button class="r-nupp ' + (olek==='dislike' ? 'dislaik' : olek==='like' ? 'inactive' : '') + '" ' +
+                        'onclick="reageeri(' + k.id + ',\'dislike\',this)">👎 ' + dislaigid + '</button>' +
+                    '<button class="btn-kustuta" onclick="kustuta(' + k.id + ')" title="Kustuta">×</button>' +
+                '</div>' +
+                pohjusHtml +
+            '</div>';
         }).join('');
-    } catch (e) {
-        el.innerHTML = '<div class="info">Laadimisviga: ' + esc(e.message) + '</div>';
-    }
+    }).catch(function(e) {
+        el.innerHTML = '<div class="info">Laadimisviga.</div>';
+    });
 }
 
 // ── Reaktsioon ────────────────────────────────────────────────────────────────
-//
-// Loogika:
-//   like   → otse baasi (põhjust ei nõuta)
-//   dislike, kui praegu MITTE dislaigitud → näita modal (põhjus kohustuslik)
-//   dislike, kui praegu JO dislaigitud    → toggle off (eemalda, põhjust ei nõuta)
-//   like/dislike vahetamine               → server uuendab, dislaigile on põhjus juba modal'ist
-//
-async function reageeri(sid, typ) {
-    const kaart = document.getElementById('k' + sid);
-    const praeguneOlek = kaart ? kaart.dataset.olek : 'none';
+
+function reageeri(id, typ, btn) {
+    var kaart = document.getElementById('k' + id);
+    var praeguneOlek = kaart ? kaart.dataset.olek : 'none';
 
     if (typ === 'dislike' && praeguneOlek !== 'dislike') {
-        // Vajame põhjust – ava modal
-        ootelSid = sid;
-        document.getElementById('pohjus').value = '';
+        ripple(btn, '#ef4444');
+        ootelId = id;
+        document.getElementById('pohjus-tekst').value = '';
         document.getElementById('modal-viga').textContent = '';
-        document.getElementById('mask').classList.add('sees');
-        setTimeout(() => document.getElementById('pohjus').focus(), 60);
+        document.getElementById('overlay').classList.add('open');
+        setTimeout(function() { document.getElementById('pohjus-tekst').focus(); }, 350);
         return;
     }
 
-    // Laik (igal juhul) või dislaigi eemaldamine (toggle off) – otse serverisse
-    try {
-        const r = await post({ a: 'reageeri', sid, typ, poh: '' });
-        if (r.ok) await laeLoend();
+    ripple(btn, typ === 'like' ? '#22c55e' : '#ef4444');
+    api('react', { id: id, type: typ, reason: '' }).then(function(r) {
+        if (r.success) laeLoend();
         else alert(r.msg);
-    } catch (e) { alert('Viga: ' + e.message); }
+    });
 }
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
-async function kinnita() {
-    const poh = document.getElementById('pohjus').value.trim();
+function kinnitaDislaik() {
+    var poh = document.getElementById('pohjus-tekst').value.trim();
     if (!poh) {
-        document.getElementById('modal-viga').textContent = 'Põhjus on kohustuslik – kirjuta midagi!';
-        document.getElementById('pohjus').focus();
+        document.getElementById('modal-viga').textContent = 'Põhjus on kohustuslik!';
+        document.getElementById('pohjus-tekst').focus();
         return;
     }
-    try {
-        const r = await post({ a: 'reageeri', sid: ootelSid, typ: 'dislike', poh });
-        if (r.ok) { sulge(); await laeLoend(); }
+    api('react', { id: ootelId, type: 'dislike', reason: poh }).then(function(r) {
+        if (r.success) { sulgeModal(); laeLoend(); }
         else document.getElementById('modal-viga').textContent = r.msg;
-    } catch (e) {
-        document.getElementById('modal-viga').textContent = 'Viga: ' + e.message;
-    }
+    });
 }
 
-function sulge() {
-    document.getElementById('mask').classList.remove('sees');
-    ootelSid = null;
+function sulgeModal() {
+    document.getElementById('overlay').classList.remove('open');
+    ootelId = null;
 }
 
-function maskKlops(e) {
-    // Sulge ainult siis, kui klikiti taustal (mitte modali sisul)
-    if (e.target === document.getElementById('mask')) sulge();
+function overlayKlõps(e) {
+    if (e.target === document.getElementById('overlay')) sulgeModal();
 }
 
-// Klaviatuuriototsed modalil
-document.addEventListener('keydown', e => {
-    const avatud = document.getElementById('mask').classList.contains('sees');
-    if (!avatud) return;
-    if (e.key === 'Escape') sulge();
-    // Enter kinnitab ainult siis, kui fookus ei ole textarea's
-    if (e.key === 'Enter' && e.target.id !== 'pohjus') {
-        e.preventDefault();
-        kinnita();
-    }
+// ── Kustuta ───────────────────────────────────────────────────────────────────
+
+function kustuta(id) {
+    if (!confirm('Kustutad selle kirje?\nKa kõik reaktsioonid kustutatakse.')) return;
+    api('delete', { id: id }).then(function(r) {
+        if (r.success) laeLoend();
+        else alert(r.error);
+    });
+}
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') sulgeModal();
 });
-
-// ── Kustuta kirje ─────────────────────────────────────────────────────────────
-// ON DELETE CASCADE tagab, et ka kõik reaktsioonid (sh dislaigi põhjused) kustutatakse
-
-async function kustuta(sid) {
-    if (!confirm('Kustutad selle kirje?\n\nKa kõik laigid, dislaigid ja põhjused kustutatakse.')) return;
-    try {
-        const r = await post({ a: 'kustuta', sid });
-        if (r.ok) await laeLoend();
-        else alert(r.msg);
-    } catch (e) { alert('Viga: ' + e.message); }
-}
 
 // ── Käivitus ──────────────────────────────────────────────────────────────────
 laeLoend();
